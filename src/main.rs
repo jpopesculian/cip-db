@@ -16,6 +16,8 @@ lazy_static::lazy_static! {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Cinema {
+    #[serde(default)]
+    id: u64,
     #[serde(rename = "value")]
     name: String,
     #[serde(rename = "url")]
@@ -105,6 +107,7 @@ impl Connection {
     fn create_cinemas(&self) -> rusqlite::Result<usize> {
         self.execute(
             "CREATE TABLE cinema (
+                id INTEGER PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
                 url_path TEXT NOT NULL,
                 address TEXT NOT NULL,
@@ -117,9 +120,10 @@ impl Connection {
     fn insert_cinema(&self, cinema: &Cinema) -> rusqlite::Result<usize> {
         self.execute(
             "INSERT INTO cinema
-                (name, url_path, address, image_path)
-                VALUES (?1, ?2, ?3, ?4)",
+                (id, name, url_path, address, image_path)
+                VALUES (?1, ?2, ?3, ?4, ?5)",
             (
+                cinema.id,
                 &cinema.name,
                 &cinema.url_path,
                 &cinema.address,
@@ -131,7 +135,7 @@ impl Connection {
     fn create_films(&self) -> rusqlite::Result<usize> {
         self.execute(
             "CREATE TABLE film (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
                 url_path TEXT NOT NULL,
                 image_path TEXT NOT NULL,
@@ -166,12 +170,15 @@ async fn main() {
     let future_cinemas = async {
         let prog = progress.add(ProgressBar::new_spinner().with_message("Downloading cinemas"));
         prog.enable_steady_tick(Duration::from_millis(100));
-        let cinemas: Vec<Cinema> = reqwest::get(CINEMAS_URL.as_str())
+        let mut cinemas: Vec<Cinema> = reqwest::get(CINEMAS_URL.as_str())
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        for (id, cinema) in cinemas.iter_mut().enumerate() {
+            cinema.id = id as u64 + 1;
+        }
         prog.finish_with_message("Downloaded cinemas");
         cinemas
     };
@@ -200,8 +207,8 @@ async fn main() {
             .with_message("Inserting cinemas"),
     );
     conn.create_cinemas().unwrap();
-    for cinema in cinemas {
-        conn.insert_cinema(&cinema).unwrap();
+    for cinema in &cinemas {
+        conn.insert_cinema(cinema).unwrap();
         prog.inc(1);
     }
     prog.finish_with_message("Inserted cinemas");
@@ -212,8 +219,8 @@ async fn main() {
             .with_message("Inserting films"),
     );
     conn.create_films().unwrap();
-    for film in films {
-        conn.insert_film(&film).unwrap();
+    for film in &films {
+        conn.insert_film(film).unwrap();
         prog.inc(1);
     }
     prog.finish_with_message("Inserted films");
