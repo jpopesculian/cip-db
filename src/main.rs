@@ -1,8 +1,10 @@
+use chrono::{prelude::*, DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use soup::prelude::*;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 lazy_static::lazy_static! {
@@ -10,8 +12,10 @@ lazy_static::lazy_static! {
     static ref FILMS_URL: Url = ROOT_URL.join("/json/movies").unwrap();
     static ref CINEMAS_URL: Url = ROOT_URL.join("/json/cinemas").unwrap();
     static ref PROG_BAR_STYLE: ProgressStyle =
-                ProgressStyle::with_template("  {msg:20} {bar:40}   {pos}/{len}")
+                ProgressStyle::with_template("  {msg:26} {bar:40}   {pos}/{len}")
                     .unwrap();
+    static ref PARIS_OFFSET: FixedOffset = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+    static ref NOW: DateTime<FixedOffset> = Utc::now().with_timezone(&*PARIS_OFFSET);
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -31,9 +35,9 @@ impl Cinema {
     fn url(&self) -> Url {
         ROOT_URL.join(&self.url_path).unwrap()
     }
-    fn image(&self) -> Url {
-        ROOT_URL.join(&self.image_path).unwrap()
-    }
+    // fn image(&self) -> Url {
+    //     ROOT_URL.join(&self.image_path).unwrap()
+    // }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -59,13 +63,22 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-impl Film {
-    fn url(&self) -> Url {
-        ROOT_URL.join(&self.url_path).unwrap()
-    }
-    fn image(&self) -> Url {
-        ROOT_URL.join(&self.image_path).unwrap()
-    }
+// impl Film {
+//     fn url(&self) -> Url {
+//         ROOT_URL.join(&self.url_path).unwrap()
+//     }
+//     fn image(&self) -> Url {
+//         ROOT_URL.join(&self.image_path).unwrap()
+//     }
+// }
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Seance {
+    cinema_id: u64,
+    film_id: u64,
+    datetime: DateTime<FixedOffset>,
+    version: String,
+    url: Option<String>,
 }
 
 pub struct Database(Arc<Pool<SqliteConnectionManager>>);
@@ -161,6 +174,50 @@ impl Connection {
             ),
         )
     }
+
+    fn create_seances(&self) -> rusqlite::Result<usize> {
+        self.execute(
+            "CREATE TABLE seance (
+                cinema_id INTEGER NOT NULL,
+                film_id INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                version TEXT NOT NULL,
+                url TEXT
+            )",
+            (),
+        )
+    }
+
+    fn insert_seance(&self, seance: &Seance) -> rusqlite::Result<usize> {
+        self.execute(
+            "INSERT INTO seance
+                (cinema_id, film_id, datetime, version, url)
+                VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                seance.cinema_id,
+                seance.film_id,
+                &seance.datetime,
+                &seance.version,
+                &seance.url,
+            ),
+        )
+    }
+}
+
+fn parse_date(date: &str) -> NaiveDate {
+    let (day, month) = date.split_once('/').unwrap();
+    let day = day.parse::<u32>().unwrap();
+    let month = month.parse::<u32>().unwrap();
+    let date = NaiveDate::from_ymd_opt(NOW.year(), month, day).unwrap();
+    if date < NOW.date_naive() {
+        NaiveDate::from_ymd_opt(NOW.year() + 1, month, day).unwrap()
+    } else {
+        date
+    }
+}
+
+fn parse_time(time: &str) -> NaiveTime {
+    NaiveTime::parse_from_str(time, "%H:%M").unwrap()
 }
 
 #[tokio::main]
@@ -179,6 +236,7 @@ async fn main() {
         for (id, cinema) in cinemas.iter_mut().enumerate() {
             cinema.id = id as u64 + 1;
         }
+        prog.disable_steady_tick();
         prog.finish_with_message("Downloaded cinemas");
         cinemas
     };
@@ -191,11 +249,11 @@ async fn main() {
             .json()
             .await
             .unwrap();
-        // prog.set_message("Downloaded films");
+        prog.disable_steady_tick();
         prog.finish_with_message("Downloaded films");
         films
     };
-    let (cinemas, films) = futures::join!(future_cinemas, future_films);
+    let (cinemas, films) = futures::future::join(future_cinemas, future_films).await;
 
     Database::delete();
     let db = Database::open();
@@ -224,4 +282,82 @@ async fn main() {
         prog.inc(1);
     }
     prog.finish_with_message("Inserted films");
+
+    conn.create_seances().unwrap();
+    futures::future::join_all(cinemas.iter().map(|cinema| async {
+        let prog = progress.add(
+            ProgressBar::new_spinner()
+                .with_message(format!("Downloading sceances: {}", cinema.name)),
+        );
+        prog.enable_steady_tick(Duration::from_millis(100));
+        let cinema_html = reqwest::get(cinema.url())
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let cinema_soup = Soup::new(&cinema_html);
+        let films_soup = cinema_soup
+            .class("movie-results-container")
+            .find_all()
+            .collect::<Vec<_>>();
+        prog.disable_steady_tick();
+        prog.set_style(PROG_BAR_STYLE.clone());
+        prog.set_message(cinema.name.clone());
+        prog.set_length(films_soup.len() as u64);
+        for film_soup in films_soup {
+            let url_path = film_soup
+                .class("poster")
+                .find()
+                .unwrap()
+                .get("href")
+                .unwrap();
+            let film = films.iter().find(|f| f.url_path == url_path).unwrap();
+            for seance_soup in film_soup.class("session-date").find_all() {
+                let date = seance_soup
+                    .class("sessionDate")
+                    .find()
+                    .unwrap()
+                    .text()
+                    .trim()
+                    .split_once(' ')
+                    .unwrap()
+                    .1
+                    .to_string();
+                let time = seance_soup
+                    .class("time")
+                    .find()
+                    .unwrap()
+                    .text()
+                    .trim()
+                    .to_string();
+                let datetime = NaiveDateTime::new(parse_date(&date), parse_time(&time))
+                    .and_local_timezone(*PARIS_OFFSET)
+                    .earliest()
+                    .unwrap();
+                let version = seance_soup
+                    .class("version")
+                    .find()
+                    .unwrap()
+                    .text()
+                    .trim()
+                    .to_string();
+                let url = seance_soup
+                    .tag("a")
+                    .find()
+                    .and_then(|link| link.get("href"));
+                let seance = Seance {
+                    cinema_id: cinema.id,
+                    film_id: film.id,
+                    datetime,
+                    version,
+                    url,
+                };
+                conn.insert_seance(&seance).unwrap();
+            }
+            prog.inc(1);
+        }
+        prog.finish();
+    }))
+    .await;
 }
