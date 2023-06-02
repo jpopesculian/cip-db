@@ -1,5 +1,5 @@
 [package]
-name = "cip-db"
+name = "cip"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,3 +17,4 @@ futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5.0"
 clap = { version = "4.3", features = ["derive", "string"] }
+ansi_term = "0.12.1"
