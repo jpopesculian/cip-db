@@ -182,7 +182,9 @@ impl Connection {
                 film_id INTEGER NOT NULL,
                 datetime TEXT NOT NULL,
                 version TEXT NOT NULL,
-                url TEXT
+                url TEXT,
+                FOREIGN KEY(cinema_id) REFERENCES cinema(id),
+                FOREIGN KEY(film_id) REFERENCES film(id)
             )",
             (),
         )
@@ -297,15 +299,11 @@ async fn main() {
             .await
             .unwrap();
         let cinema_soup = Soup::new(&cinema_html);
-        let films_soup = cinema_soup
-            .class("movie-results-container")
-            .find_all()
-            .collect::<Vec<_>>();
         prog.disable_steady_tick();
         prog.set_style(PROG_BAR_STYLE.clone());
         prog.set_message(cinema.name.clone());
-        prog.set_length(films_soup.len() as u64);
-        for film_soup in films_soup {
+        prog.set_length(cinema_soup.class("session-date").find_all().count() as u64);
+        for film_soup in cinema_soup.class("movie-results-container").find_all() {
             let url_path = film_soup
                 .class("poster")
                 .find()
@@ -354,8 +352,8 @@ async fn main() {
                     url,
                 };
                 conn.insert_seance(&seance).unwrap();
+                prog.inc(1);
             }
-            prog.inc(1);
         }
         prog.finish();
     }))
