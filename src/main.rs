@@ -87,9 +87,9 @@ impl Film {
     fn description(&self) -> String {
         format!("{} ({})", self.name, self.release_date)
     }
-    // fn url(&self) -> Url {
-    //     ROOT_URL.join(&self.url_path).unwrap()
-    // }
+    fn url(&self) -> Url {
+        ROOT_URL.join(&self.url_path).unwrap()
+    }
     // fn image(&self) -> Url {
     //     ROOT_URL.join(&self.image_path).unwrap()
     // }
@@ -105,10 +105,26 @@ struct Seance {
     url: Option<String>,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum Version {
+    Original,
+    French,
+}
+
+impl Version {
+    fn short(&self) -> &'static str {
+        match self {
+            Self::Original => "VO",
+            Self::French => "VF",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct QueryOptions {
     day: Option<NaiveDate>,
     time: Option<NaiveTime>,
+    version: Option<Version>,
 }
 
 impl QueryOptions {
@@ -268,6 +284,9 @@ impl Connection {
         if let Some(before) = options.before() {
             where_clauses.push(format!("datetime <= '{}'", before.to_rfc3339()));
         }
+        if let Some(version) = options.version {
+            where_clauses.push(format!("version = '{}'", version.short()));
+        }
         let where_clause = if !where_clauses.is_empty() {
             format!("WHERE {}", where_clauses.join(" AND "))
         } else {
@@ -312,6 +331,48 @@ impl Connection {
             })
         })?;
         rows.collect()
+    }
+
+    fn get_seance(&self, id: u64) -> rusqlite::Result<Option<QueryResult>> {
+        let mut stmt = self.prepare_cached(
+            "SELECT
+                seance.id, cinema_id, film_id, datetime, version, url,
+                cinema.name, cinema.url_path, cinema.address, cinema.image_path,
+                film.name, film.url_path, film.image_path, film.director, film.release_date
+            FROM seance
+            INNER JOIN cinema ON cinema.id = seance.cinema_id
+            INNER JOIN film ON film.id = seance.film_id
+            WHERE seance.id = ?1
+            ORDER BY datetime ASC",
+        )?;
+        let mut rows = stmt.query_map([id], |row| {
+            Ok(QueryResult {
+                cinema: Cinema {
+                    id: row.get(1)?,
+                    name: row.get(6)?,
+                    url_path: row.get(7)?,
+                    address: row.get(8)?,
+                    image_path: row.get(9)?,
+                },
+                film: Film {
+                    id: row.get(2)?,
+                    name: row.get(10)?,
+                    url_path: row.get(11)?,
+                    image_path: row.get(12)?,
+                    director: row.get(13)?,
+                    release_date: row.get(14)?,
+                },
+                seance: Seance {
+                    id: row.get(0)?,
+                    cinema_id: row.get(1)?,
+                    film_id: row.get(2)?,
+                    datetime: row.get(3)?,
+                    version: row.get(4)?,
+                    url: row.get(5)?,
+                },
+            })
+        })?;
+        rows.next().transpose()
     }
 }
 
@@ -479,7 +540,7 @@ async fn scrape(args: ScrapeArgs) {
     .await;
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum GroupBy {
     Cinema,
     Film,
@@ -496,6 +557,13 @@ struct QueryArgs {
     /// Time to query after HH:MM
     #[arg(long, short = 't')]
     time: Option<String>,
+    /// Show VF only
+    #[arg(long)]
+    vf: bool,
+    /// Show VO only
+    #[arg(long)]
+    vo: bool,
+    /// Group by cinemas or films
     #[arg(long, short = 'g', value_enum, default_value_t = GroupBy::Cinema)]
     group: GroupBy,
 }
@@ -510,6 +578,13 @@ async fn query(args: QueryArgs) {
     let options = QueryOptions {
         day: args.day.as_ref().map(|d| parse_date(d)),
         time: args.time.as_ref().map(|t| parse_time(t)),
+        version: if args.vf && !args.vo {
+            Some(Version::French)
+        } else if !args.vf && args.vo {
+            Some(Version::Original)
+        } else {
+            None
+        },
     };
     let db = Database::open(&args.db_path);
     let conn = db.conn().unwrap();
@@ -560,6 +635,39 @@ async fn query(args: QueryArgs) {
     }
 }
 
+#[derive(Args, Debug)]
+pub struct SeanceArgs {
+    /// Seance ID
+    id: u64,
+    /// Database file path
+    #[arg(long, default_value = DEFAULT_DB_PATH.display().to_string())]
+    db_path: PathBuf,
+}
+
+async fn seance(args: SeanceArgs) {
+    let db = Database::open(&args.db_path);
+    let conn = db.conn().unwrap();
+    let result = if let Some(result) = conn.get_seance(args.id).unwrap() {
+        result
+    } else {
+        println!("Seance {} not found", style_id(args.id));
+        return;
+    };
+    println!("{}", style_id(result.seance.id),);
+    println!("Film:    {}", result.film.description());
+    println!("         {}", result.film.director);
+    println!("         {}", result.film.url());
+    println!("Cinema:  {}", result.cinema.name);
+    println!("         {}", result.cinema.address);
+    println!("         {}", result.cinema.url());
+    println!("Version: {}", result.seance.version);
+    println!("Date:    {}", result.seance.datetime.format("%b %d"));
+    println!("Time:    {}", result.seance.datetime.format("%H:%M"));
+    if let Some(url) = result.seance.url {
+        println!("Reserve: {url}");
+    }
+}
+
 async fn clean(args: ScrapeArgs) {
     Database::delete(args.db_path);
 }
@@ -576,6 +684,8 @@ enum Commands {
     Scrape(ScrapeArgs),
     /// Query the database
     Query(QueryArgs),
+    /// Get information about a seance
+    Seance(SeanceArgs),
     /// Delete database
     Clean(ScrapeArgs),
 }
@@ -586,6 +696,7 @@ async fn main() {
     match args.command {
         Commands::Scrape(args) => scrape(args).await,
         Commands::Query(args) => query(args).await,
+        Commands::Seance(args) => seance(args).await,
         Commands::Clean(args) => clean(args).await,
     }
 }
