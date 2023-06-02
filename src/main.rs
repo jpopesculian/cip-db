@@ -1,11 +1,17 @@
 use chrono::{prelude::*, DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use clap::{Args, Parser, Subcommand};
+use directories::ProjectDirs;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use soup::prelude::*;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 lazy_static::lazy_static! {
     static ref ROOT_URL: Url = Url::parse("https://www.cip-paris.fr").unwrap();
@@ -16,6 +22,8 @@ lazy_static::lazy_static! {
                     .unwrap();
     static ref PARIS_OFFSET: FixedOffset = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
     static ref NOW: DateTime<FixedOffset> = Utc::now().with_timezone(&*PARIS_OFFSET);
+    static ref PROJECT_DIRS: ProjectDirs = ProjectDirs::from("com.github", "jpopesculian", "cpi-db").unwrap();
+    static ref DEFAULT_DB_PATH: PathBuf = PROJECT_DIRS.data_dir().join("data.db");
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -84,21 +92,17 @@ struct Seance {
 pub struct Database(Arc<Pool<SqliteConnectionManager>>);
 
 impl Database {
-    pub fn path() -> PathBuf {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "data.db".to_string())
-            .into()
-    }
-    pub fn open() -> Self {
-        let path = std::env::var("DATABASE_URL").unwrap_or_else(|_| "data.db".to_string());
+    pub fn open(path: impl AsRef<Path>) -> Self {
+        std::fs::create_dir_all(path.as_ref().parent().unwrap()).unwrap();
         let manager = SqliteConnectionManager::file(path);
         let pool = Pool::new(manager).unwrap();
         Self(Arc::new(pool))
     }
 
-    pub fn delete() {
-        if Self::path().exists() {
-            std::fs::remove_file(Self::path()).unwrap();
+    pub fn delete(path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
         }
     }
 
@@ -222,8 +226,14 @@ fn parse_time(time: &str) -> NaiveTime {
     NaiveTime::parse_from_str(time, "%H:%M").unwrap()
 }
 
-#[tokio::main]
-async fn main() {
+#[derive(Args, Debug)]
+struct ScrapeArgs {
+    /// Database file path
+    #[arg(long, short = 'd', default_value = DEFAULT_DB_PATH.display().to_string())]
+    db_path: PathBuf,
+}
+
+async fn scrape(args: ScrapeArgs) {
     let progress = MultiProgress::new();
 
     let future_cinemas = async {
@@ -257,8 +267,8 @@ async fn main() {
     };
     let (cinemas, films) = futures::future::join(future_cinemas, future_films).await;
 
-    Database::delete();
-    let db = Database::open();
+    Database::delete(&args.db_path);
+    let db = Database::open(&args.db_path);
     let conn = db.conn().unwrap();
 
     let prog = progress.add(
@@ -358,4 +368,24 @@ async fn main() {
         prog.finish();
     }))
     .await;
+}
+
+#[derive(Parser, Debug)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Scrape cip-paris.fr and insert data into the database
+    Scrape(ScrapeArgs),
+}
+
+#[tokio::main]
+async fn main() {
+    let args: Cli = Cli::parse();
+    match args.command {
+        Commands::Scrape(args) => scrape(args).await,
+    }
 }
