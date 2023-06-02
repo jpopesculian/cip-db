@@ -9,14 +9,12 @@ use reqwest::Url;
 use serde::Deserialize;
 use soup::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{self, AtomicU64},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
+use tokio::sync::Mutex;
 
 lazy_static::lazy_static! {
     static ref ROOT_URL: Url = Url::parse("https://www.cip-paris.fr").unwrap();
@@ -435,36 +433,7 @@ async fn scrape(args: ScrapeArgs) {
     };
     let (cinemas, films) = futures::future::join(future_cinemas, future_films).await;
 
-    Database::delete(&args.db_path);
-    let db = Database::open(&args.db_path);
-    let conn = db.conn().unwrap();
-
-    let prog = progress.add(
-        ProgressBar::new(cinemas.len() as u64)
-            .with_style(PROG_BAR_STYLE.clone())
-            .with_message("Inserting cinemas"),
-    );
-    conn.create_cinemas().unwrap();
-    for cinema in &cinemas {
-        conn.insert_cinema(cinema).unwrap();
-        prog.inc(1);
-    }
-    prog.finish_with_message("Inserted cinemas");
-
-    let prog = progress.add(
-        ProgressBar::new(films.len() as u64)
-            .with_style(PROG_BAR_STYLE.clone())
-            .with_message("Inserting films"),
-    );
-    conn.create_films().unwrap();
-    for film in &films {
-        conn.insert_film(film).unwrap();
-        prog.inc(1);
-    }
-    prog.finish_with_message("Inserted films");
-
-    conn.create_seances().unwrap();
-    let seance_id = AtomicU64::new(1);
+    let seances = Arc::new(Mutex::new(Vec::<Seance>::new()));
     futures::future::join_all(cinemas.iter().map(|cinema| async {
         let prog = progress.add(
             ProgressBar::new_spinner()
@@ -523,21 +492,73 @@ async fn scrape(args: ScrapeArgs) {
                     .tag("a")
                     .find()
                     .and_then(|link| link.get("href"));
-                let seance = Seance {
-                    id: seance_id.fetch_add(1, atomic::Ordering::Relaxed),
-                    cinema_id: cinema.id,
-                    film_id: film.id,
-                    datetime,
-                    version,
-                    url,
-                };
-                conn.insert_seance(&seance).unwrap();
+                let mut seances = seances.lock().await;
+                let exists = seances.iter().any(|s| {
+                    s.cinema_id == cinema.id
+                        && s.film_id == film.id
+                        && s.datetime == datetime
+                        && s.version == version
+                        && s.url == url
+                });
+                if !exists {
+                    let id = seances.len() as u64 + 1;
+                    seances.push(Seance {
+                        id,
+                        cinema_id: cinema.id,
+                        film_id: film.id,
+                        datetime,
+                        version,
+                        url,
+                    });
+                }
+                // conn.insert_seance(&seance).unwrap();
                 prog.inc(1);
             }
         }
         prog.finish();
     }))
     .await;
+
+    Database::delete(&args.db_path);
+    let db = Database::open(&args.db_path);
+    let conn = db.conn().unwrap();
+
+    let prog = progress.add(
+        ProgressBar::new(cinemas.len() as u64)
+            .with_style(PROG_BAR_STYLE.clone())
+            .with_message("Inserting cinemas"),
+    );
+    conn.create_cinemas().unwrap();
+    for cinema in &cinemas {
+        conn.insert_cinema(cinema).unwrap();
+        prog.inc(1);
+    }
+    prog.finish_with_message("Inserted cinemas");
+
+    let prog = progress.add(
+        ProgressBar::new(films.len() as u64)
+            .with_style(PROG_BAR_STYLE.clone())
+            .with_message("Inserting films"),
+    );
+    conn.create_films().unwrap();
+    for film in &films {
+        conn.insert_film(film).unwrap();
+        prog.inc(1);
+    }
+    prog.finish_with_message("Inserted films");
+
+    let seances = seances.lock().await;
+    let prog = progress.add(
+        ProgressBar::new(seances.len() as u64)
+            .with_style(PROG_BAR_STYLE.clone())
+            .with_message("Inserting seances"),
+    );
+    conn.create_seances().unwrap();
+    for seance in seances.iter() {
+        conn.insert_seance(seance).unwrap();
+        prog.inc(1);
+    }
+    prog.finish_with_message("Inserted seances");
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -568,7 +589,7 @@ struct QueryArgs {
     group: GroupBy,
 }
 
-type Grouping = HashMap<u64, (String, HashMap<u64, (String, Vec<QueryResult>)>)>;
+type Grouping = BTreeMap<u64, (String, BTreeMap<u64, (String, Vec<QueryResult>)>)>;
 
 fn style_id(id: u64) -> ANSIGenericString<'static, str> {
     Style::new().dimmed().paint(format!("[{id}]"))
@@ -593,7 +614,7 @@ async fn query(args: QueryArgs) {
         match args.group {
             GroupBy::Cinema => grouping
                 .entry(result.cinema.id)
-                .or_insert_with(|| (result.cinema.description(), HashMap::new()))
+                .or_insert_with(|| (result.cinema.description(), BTreeMap::new()))
                 .1
                 .entry(result.film.id)
                 .or_insert_with(|| (result.film.description(), Vec::new()))
@@ -601,7 +622,7 @@ async fn query(args: QueryArgs) {
                 .push(result),
             GroupBy::Film => grouping
                 .entry(result.film.id)
-                .or_insert_with(|| (result.film.description(), HashMap::new()))
+                .or_insert_with(|| (result.film.description(), BTreeMap::new()))
                 .1
                 .entry(result.cinema.id)
                 .or_insert_with(|| (result.cinema.description(), Vec::new()))
